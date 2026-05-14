@@ -79,6 +79,25 @@ See [LIBERO.md](LIBERO.md) for fine-tuning/evaluating on LIBERO simulation bench
 
 See [ALOHA.md](ALOHA.md) for fine-tuning/evaluating on real-world ALOHA robot tasks.
 
+## AdaVLA-RL Adaptive Compute
+
+This branch adds AdaVLA-RL adaptive-compute training and evaluation utilities for choosing token budgets, language-model depth, and slow/fast path behavior during policy inference.
+
+Relevant entry points:
+* `vla-scripts/train_adavla_rl.py`: offline PPO-style compute-policy training with an action-error reward proxy.
+* `vla-scripts/train_adavla_rl_libero.py`: online LIBERO rollout training with task-success reward.
+* `vla-scripts/finetune.py`: OpenVLA-OFT fine-tuning with optional `--use_adaptive_compute True`.
+
+A smoke run was completed on an NVIDIA A800 80GB using `libero_spatial_no_noops` from `/root/autodl-tmp/modified_libero_rlds_sample`:
+* Training: 10 gradient steps with LoRA, L1 action head, proprio input, and adaptive compute enabled.
+* Evaluation: 10 RLDS batches with the saved LoRA adapter, action head, proprio projector, and compute policy.
+* Result summary: `mean_loss_value=1.24453125`, `mean_curr_action_l1_loss=1.1921875`, `mean_next_actions_l1_loss=1.25234375`, `mean_compute_cost=0.11611328`, `mean_compute_token_budget=32.0`, `mean_compute_layer_depth=4.0`.
+
+The remote run logs and `eval_results.json` are available in the checkpoint-free GitHub release asset:
+https://github.com/scout-123-china/openvla-oft/releases/tag/adavla-rl-remote-no-checkpoints-20260514-1430
+
+Checkpoint and model-weight files (`*.pt`, `*.pth`, `*.safetensors`) are intentionally excluded from GitHub uploads.
+
 ## Support
 
 If you run into any issues, please open a new GitHub issue. If you do not receive a response within 2 business days, please email Moo Jin Kim (moojink@cs.stanford.edu) to bring the issue to his attention.
