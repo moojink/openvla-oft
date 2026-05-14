@@ -4,39 +4,36 @@ deploy.py
 Starts VLA server which the client can query to get robot actions.
 """
 
-import os.path
-
 # ruff: noqa: E402
 import json_numpy
 
 json_numpy.patch()
 import json
 import logging
-import numpy as np
+import threading
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Union
 
 import draccus
-import torch
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from PIL import Image
-from transformers import AutoModelForVision2Seq, AutoProcessor
 
 from experiments.robot.openvla_utils import (
-    get_vla,
-    get_vla_action,
     get_action_head,
+    get_compute_policy,
+    get_fast_path_action_head,
     get_processor,
     get_proprio_projector,
+    get_vla,
+    get_vla_action,
 )
 from experiments.robot.robot_utils import (
     get_image_resize_size,
 )
-from prismatic.vla.constants import ACTION_DIM, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, STOP_INDEX
+from prismatic.vla.constants import PROPRIO_DIM
 
 
 def get_openvla_prompt(instruction: str, openvla_path: Union[str, Path]) -> str:
@@ -53,6 +50,7 @@ class OpenVLAServer:
 
         # Load model
         self.vla = get_vla(cfg)
+        self.inference_lock = threading.Lock()
 
         # Load proprio projector
         self.proprio_projector = None
@@ -63,6 +61,14 @@ class OpenVLAServer:
         self.action_head = None
         if cfg.use_l1_regression or cfg.use_diffusion:
             self.action_head = get_action_head(cfg, self.vla.llm_dim)
+
+        self.compute_policy = None
+        if cfg.use_adaptive_compute:
+            self.compute_policy = get_compute_policy(cfg, self.vla.llm_dim)
+
+        self.fast_path_action_head = None
+        if cfg.use_fast_path:
+            self.fast_path_action_head = get_fast_path_action_head(cfg, self.vla.llm_dim)
 
         # Check that the model contains the action un-normalization key
         assert cfg.unnorm_key in self.vla.norm_stats, f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`!"
@@ -85,9 +91,19 @@ class OpenVLAServer:
             observation = payload
             instruction = observation["instruction"]
 
-            action = get_vla_action(
-                self.cfg, self.vla, self.processor, observation, instruction, action_head=self.action_head, proprio_projector=self.proprio_projector, use_film=self.cfg.use_film,
-            )
+            with self.inference_lock:
+                action = get_vla_action(
+                    self.cfg,
+                    self.vla,
+                    self.processor,
+                    observation,
+                    instruction,
+                    action_head=self.action_head,
+                    proprio_projector=self.proprio_projector,
+                    compute_policy=self.compute_policy,
+                    fast_path_action_head=self.fast_path_action_head,
+                    use_film=self.cfg.use_film,
+                )
 
             if double_encode:
                 return JSONResponse(json_numpy.dumps(action))
@@ -128,6 +144,15 @@ class DeployConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 3                     # Number of images in the VLA input (default: 3)
     use_proprio: bool = True                         # Whether to include proprio state in input
+    use_adaptive_compute: bool = False               # If True, enables AdaVLA-RL dynamic compute at inference
+    adaptive_compute_mode: str = "greedy"            # "greedy" for serving, "sample" for exploration
+    compute_policy_checkpoint: Union[str, Path] = "" # Optional compute_policy checkpoint file or directory
+    compute_policy_hidden_dim: int = 512             # Must match training
+    compute_token_budgets: tuple = (16, 32, 64, 128) # Candidate visual token budgets
+    compute_layer_depths: tuple = (4, 8, 12)         # Candidate language-model depths
+    use_fast_path: bool = False                      # If True, load and use optional fast-path action head
+    fast_path_checkpoint: Union[str, Path] = ""      # Optional fast-path checkpoint file or directory
+    fast_path_hidden_dim: int = 512                  # Must match fast-path training
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
 

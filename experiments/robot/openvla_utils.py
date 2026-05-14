@@ -24,6 +24,7 @@ json_numpy.patch()
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+from prismatic.models.adaptive_compute import AdaptiveComputePolicy, FastPathActionHead, compute_policy_state_dim
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
@@ -517,6 +518,69 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
     return action_head
 
 
+def _resolve_local_or_component_checkpoint(cfg: Any, explicit_path_attr: str, file_pattern: str) -> str:
+    explicit_path = getattr(cfg, explicit_path_attr, "")
+    if explicit_path:
+        explicit_path = str(explicit_path)
+        if os.path.isfile(explicit_path):
+            return explicit_path
+        if os.path.isdir(explicit_path):
+            return find_checkpoint_file(explicit_path, file_pattern)
+        raise FileNotFoundError(f"Could not find `{explicit_path_attr}` at: {explicit_path}")
+
+    if model_is_on_hf_hub(cfg.pretrained_checkpoint):
+        raise ValueError(
+            f"AdaVLA-RL component `{file_pattern}` is not mapped for HF Hub checkpoints. "
+            f"Pass --{explicit_path_attr}=<local checkpoint file or directory>."
+        )
+    return find_checkpoint_file(cfg.pretrained_checkpoint, file_pattern)
+
+
+def get_compute_policy(cfg: Any, llm_dim: int) -> AdaptiveComputePolicy:
+    """Load AdaVLA-RL compute policy from a checkpoint."""
+
+    state_dim = compute_policy_state_dim(
+        llm_dim,
+        previous_action_dim=ACTION_DIM,
+        uncertainty_dim=1,
+        include_intermediate=True,
+    )
+    compute_policy = AdaptiveComputePolicy(
+        state_dim=state_dim,
+        hidden_dim=getattr(cfg, "compute_policy_hidden_dim", 512),
+        token_budgets=getattr(cfg, "compute_token_budgets", (16, 32, 64, 128)),
+        layer_depths=getattr(cfg, "compute_layer_depths", (4, 8, 12)),
+    ).to(DEVICE)
+
+    checkpoint_path = _resolve_local_or_component_checkpoint(cfg, "compute_policy_checkpoint", "compute_policy")
+    state_dict = load_component_state_dict(checkpoint_path)
+    compute_policy.load_state_dict(state_dict)
+    compute_policy.eval()
+    return compute_policy
+
+
+def get_fast_path_action_head(cfg: Any, llm_dim: int) -> FastPathActionHead:
+    """Load optional lightweight fast-path action head."""
+
+    state_dim = compute_policy_state_dim(
+        llm_dim,
+        previous_action_dim=ACTION_DIM,
+        uncertainty_dim=1,
+        include_intermediate=True,
+    )
+    fast_path_action_head = FastPathActionHead(
+        state_dim=state_dim,
+        hidden_dim=getattr(cfg, "fast_path_hidden_dim", 512),
+        action_dim=ACTION_DIM,
+    ).to(DEVICE)
+
+    checkpoint_path = _resolve_local_or_component_checkpoint(cfg, "fast_path_checkpoint", "fast_path")
+    state_dict = load_component_state_dict(checkpoint_path)
+    fast_path_action_head.load_state_dict(state_dict)
+    fast_path_action_head.eval()
+    return fast_path_action_head
+
+
 def resize_image_for_policy(img: np.ndarray, resize_size: Union[int, Tuple[int, int]]) -> np.ndarray:
     """
     Resize an image to match the policy's expected input size.
@@ -721,6 +785,8 @@ def get_vla_action(
     action_head: Optional[torch.nn.Module] = None,
     proprio_projector: Optional[torch.nn.Module] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
+    compute_policy: Optional[torch.nn.Module] = None,
+    fast_path_action_head: Optional[torch.nn.Module] = None,
     use_film: bool = False,
 ) -> List[np.ndarray]:
     """
@@ -735,6 +801,8 @@ def get_vla_action(
         action_head: Optional action head for continuous actions
         proprio_projector: Optional proprioception projector
         noisy_action_projector: Optional noisy action projector for diffusion
+        compute_policy: Optional AdaVLA-RL compute policy
+        fast_path_action_head: Optional lightweight fast-path action head
         use_film: Whether to use FiLM
 
     Returns:
@@ -780,7 +848,15 @@ def get_vla_action(
         # Generate action
         if action_head is None:
             # Standard VLA output (single-image inputs, discrete actions)
-            action, _ = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False)
+            action, _ = vla.predict_action(
+                **inputs,
+                unnorm_key=cfg.unnorm_key,
+                do_sample=False,
+                compute_policy=compute_policy,
+                fast_path_action_head=fast_path_action_head,
+                use_adaptive_compute=getattr(cfg, "use_adaptive_compute", False),
+                adaptive_compute_mode=getattr(cfg, "adaptive_compute_mode", "greedy"),
+            )
         else:
             # Custom action head for continuous actions
             action, _ = vla.predict_action(
@@ -792,6 +868,10 @@ def get_vla_action(
                 noisy_action_projector=noisy_action_projector,
                 action_head=action_head,
                 use_film=use_film,
+                compute_policy=compute_policy,
+                fast_path_action_head=fast_path_action_head,
+                use_adaptive_compute=getattr(cfg, "use_adaptive_compute", False),
+                adaptive_compute_mode=getattr(cfg, "adaptive_compute_mode", "greedy"),
             )
 
     # Return action chunk as list of actions

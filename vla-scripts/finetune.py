@@ -17,7 +17,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import tqdm
 from accelerate import PartialState
-from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import snapshot_download
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
@@ -37,6 +37,7 @@ from experiments.robot.openvla_utils import (
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+from prismatic.models.adaptive_compute import AdaptiveComputePolicy, ComputeCostConfig, compute_policy_state_dim
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
@@ -83,6 +84,15 @@ class FinetuneConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
+    use_adaptive_compute: bool = False               # If True, trains AdaVLA-RL compute policy during fine-tuning
+    compute_policy_hidden_dim: int = 512             # Hidden size for the compute policy actor-critic MLP
+    compute_token_budgets: Tuple[int, ...] = (16, 32, 64, 128)  # Candidate visual token budgets k_t
+    compute_layer_depths: Tuple[int, ...] = (4, 8, 12)           # Candidate language-model depths d_t
+    compute_cost_lambda: float = 0.03                # Reward penalty weight for normalized compute cost
+    compute_slow_path_cost_weight: float = 0.1       # Extra normalized cost for choosing the slow path r_t=1
+    compute_policy_loss_coef: float = 1.0            # Weight for policy-gradient compute loss
+    compute_value_loss_coef: float = 0.5             # Value baseline loss weight
+    compute_entropy_coef: float = 0.01               # Entropy bonus weight for exploration
 
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
@@ -174,6 +184,8 @@ def get_run_id(cfg) -> str:
             run_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
         if cfg.image_aug:
             run_id += "--image_aug"
+        if cfg.use_adaptive_compute:
+            run_id += f"--adavla_rl-lambda-{cfg.compute_cost_lambda}"
         if cfg.run_id_note is not None:
             run_id += f"--{cfg.run_id_note}"
     return run_id
@@ -279,6 +291,14 @@ def run_forward_pass(
     use_proprio,
     use_film,
     num_patches,
+    compute_policy=None,
+    use_adaptive_compute=False,
+    adaptive_compute_mode="sample",
+    compute_cost_lambda=0.03,
+    compute_slow_path_cost_weight=0.1,
+    compute_policy_loss_coef=1.0,
+    compute_value_loss_coef=0.5,
+    compute_entropy_coef=0.01,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -323,13 +343,24 @@ def run_forward_pass(
     else:
         noise, noisy_actions, diffusion_timestep_embeddings = None, None, None
 
+    previous_action = batch.get("prev_action", None)
+    if previous_action is None:
+        previous_action = torch.zeros(
+            ground_truth_actions.shape[0],
+            ACTION_DIM,
+            device=device_id,
+            dtype=ground_truth_actions.dtype,
+        )
+    else:
+        previous_action = previous_action.to(device_id).to(ground_truth_actions.dtype)
+
     # VLA forward pass
     with torch.autocast("cuda", dtype=torch.bfloat16):
         output: CausalLMOutputWithPast = vla(
             input_ids=batch["input_ids"].to(device_id),
             attention_mask=batch["attention_mask"].to(device_id),
             pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
-            labels=batch["labels"],
+            labels=batch["labels"].to(device_id),
             output_hidden_states=True,
             proprio=batch["proprio"] if use_proprio else None,
             proprio_projector=proprio_projector if use_proprio else None,
@@ -337,6 +368,11 @@ def run_forward_pass(
             noisy_action_projector=noisy_action_projector if use_diffusion else None,
             diffusion_timestep_embeddings=diffusion_timestep_embeddings if use_diffusion else None,
             use_film=use_film,
+            compute_policy=compute_policy,
+            use_adaptive_compute=use_adaptive_compute,
+            adaptive_compute_mode=adaptive_compute_mode,
+            previous_action=previous_action,
+            compute_cost_config=ComputeCostConfig(slow_path_weight=compute_slow_path_cost_weight),
         )
 
     # Get action masks needed for logging
@@ -347,7 +383,8 @@ def run_forward_pass(
     # Compute metrics for discrete action representation (next-token prediction)
     if not (use_l1_regression or use_diffusion):
         loss = output.loss
-        predicted_token_ids = output.logits[:, num_patches:-1].argmax(dim=2)
+        effective_num_patches = output.projector_features.shape[1] if output.projector_features is not None else num_patches
+        predicted_token_ids = output.logits[:, effective_num_patches:-1].argmax(dim=2)
         curr_action_accuracy = compute_token_accuracy(
             predicted_token_ids, ground_truth_token_ids, mask=current_action_mask
         )
@@ -374,7 +411,8 @@ def run_forward_pass(
         # Get last layer hidden states
         last_hidden_states = output.hidden_states[-1]  # (B, seq_len, D)
         # Get hidden states for text portion of prompt+response (after the vision patches)
-        text_hidden_states = last_hidden_states[:, num_patches:-1]
+        effective_num_patches = output.projector_features.shape[1] if output.projector_features is not None else num_patches
+        text_hidden_states = last_hidden_states[:, effective_num_patches:-1]
         # Get hidden states for action portion of response
         batch_size = batch["input_ids"].shape[0]
         actions_hidden_states = (
@@ -436,6 +474,37 @@ def run_forward_pass(
                     "next_actions_l1_loss": next_actions_l1_loss.item(),
                 }
             )
+
+    if use_adaptive_compute and getattr(output, "compute_log_prob", None) is not None:
+        compute_cost = output.compute_cost.float()
+        task_reward = (-loss.detach().float()).expand_as(compute_cost)
+        compute_reward = task_reward - compute_cost_lambda * compute_cost.detach()
+        advantage = compute_reward - output.compute_value.detach().float()
+        policy_loss = -(output.compute_log_prob.float() * advantage).mean()
+        value_loss = nn.functional.mse_loss(output.compute_value.float(), compute_reward)
+        entropy = output.compute_entropy.float().mean()
+        compute_loss = compute_policy_loss_coef * (
+            policy_loss + compute_value_loss_coef * value_loss - compute_entropy_coef * entropy
+        )
+        loss = loss + compute_loss
+        metrics.update(
+            {
+                "compute_policy_loss": compute_loss.item(),
+                "compute_reward": compute_reward.mean().item(),
+                "compute_cost": compute_cost.mean().item(),
+                "compute_vision_cost": output.compute_metrics["vision_cost"].float().mean().item(),
+                "compute_llm_cost": output.compute_metrics["llm_cost"].float().mean().item(),
+                "compute_token_budget": output.compute_metrics["token_budget"].float().mean().item(),
+                "compute_layer_depth": output.compute_metrics["layer_depth"].float().mean().item(),
+                "compute_effective_token_budget": output.compute_metrics["effective_token_budget"]
+                .float()
+                .mean()
+                .item(),
+                "compute_effective_layer_depth": output.compute_metrics["effective_layer_depth"].float().mean().item(),
+                "compute_slow_path_ratio": output.compute_metrics["path"].float().mean().item(),
+                "total_loss_value": loss.item(),
+            }
+        )
 
     # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)
     return loss, metrics
@@ -503,7 +572,7 @@ def run_diffusion_sampling(
                 input_ids=batch["input_ids"].to(device_id),
                 attention_mask=batch["attention_mask"].to(device_id),
                 pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
-                labels=batch["labels"],
+                labels=batch["labels"].to(device_id),
                 output_hidden_states=True,
                 proprio=batch["proprio"] if use_proprio else None,
                 proprio_projector=proprio_projector if use_proprio else None,
@@ -541,9 +610,9 @@ def compute_smoothened_metrics(metrics_deques) -> dict:
         dict: Dictionary of smoothened metrics.
     """
     smoothened_metrics = {}
-    for name, deque in metrics_deques.items():
-        if deque and len(deque) > 0:
-            smoothened_metrics[name] = sum(deque) / len(deque)
+    for name, metric_values in metrics_deques.items():
+        if metric_values and len(metric_values) > 0:
+            smoothened_metrics[name] = sum(metric_values) / len(metric_values)
     return smoothened_metrics
 
 
@@ -580,6 +649,7 @@ def save_training_checkpoint(
     proprio_projector,
     noisy_action_projector,
     action_head,
+    compute_policy,
     train_dataset,
     distributed_state,
 ) -> None:
@@ -639,6 +709,9 @@ def save_training_checkpoint(
         if (cfg.use_l1_regression or cfg.use_diffusion) and action_head is not None:
             torch.save(action_head.state_dict(), checkpoint_dir / f"action_head--{checkpoint_name_suffix}")
 
+        if cfg.use_adaptive_compute and compute_policy is not None:
+            torch.save(compute_policy.state_dict(), checkpoint_dir / f"compute_policy--{checkpoint_name_suffix}")
+
         if cfg.use_film:
             # To be safe, just save the entire vision backbone (not just FiLM components)
             torch.save(
@@ -678,6 +751,7 @@ def run_validation(
     log_step,
     distributed_state,
     val_time_limit,
+    compute_policy=None,
 ) -> None:
     """
     Compute validation set metrics for logging.
@@ -701,6 +775,8 @@ def run_validation(
     """
     val_start_time = time.time()
     vla.eval()
+    if compute_policy is not None:
+        compute_policy.eval()
     val_batches_count = 0
 
     # List to store validation metrics
@@ -722,6 +798,14 @@ def run_validation(
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=num_patches,
+                compute_policy=compute_policy,
+                use_adaptive_compute=cfg.use_adaptive_compute,
+                adaptive_compute_mode="greedy",
+                compute_cost_lambda=cfg.compute_cost_lambda,
+                compute_slow_path_cost_weight=cfg.compute_slow_path_cost_weight,
+                compute_policy_loss_coef=cfg.compute_policy_loss_coef,
+                compute_value_loss_coef=cfg.compute_value_loss_coef,
+                compute_entropy_coef=cfg.compute_entropy_coef,
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
             )
@@ -748,6 +832,9 @@ def run_validation(
     # Log validation metrics to W&B
     if distributed_state.is_main_process:
         log_metrics_to_wandb(avg_val_metrics, "VLA Val", log_step, wandb)
+
+    if compute_policy is not None:
+        compute_policy.train()
 
 
 @draccus.wrap()
@@ -914,6 +1001,28 @@ def finetune(cfg: FinetuneConfig) -> None:
             NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim}
         )
 
+    compute_policy = None
+    if cfg.use_adaptive_compute:
+        compute_state_dim = compute_policy_state_dim(
+            vla.module.llm_dim,
+            previous_action_dim=ACTION_DIM,
+            uncertainty_dim=1,
+            include_intermediate=True,
+        )
+        compute_policy = init_module(
+            AdaptiveComputePolicy,
+            "compute_policy",
+            cfg,
+            device_id,
+            {
+                "state_dim": compute_state_dim,
+                "hidden_dim": cfg.compute_policy_hidden_dim,
+                "token_budgets": cfg.compute_token_budgets,
+                "layer_depths": cfg.compute_layer_depths,
+            },
+            find_unused_params=True,
+        )
+
     # Get number of vision patches
     NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
@@ -931,6 +1040,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
     if cfg.use_proprio:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
+    if cfg.use_adaptive_compute:
+        trainable_params += [param for param in compute_policy.parameters() if param.requires_grad]
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
@@ -1026,6 +1137,17 @@ def finetune(cfg: FinetuneConfig) -> None:
         "curr_action_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "compute_policy_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "compute_reward": deque(maxlen=cfg.grad_accumulation_steps),
+        "compute_cost": deque(maxlen=cfg.grad_accumulation_steps),
+        "compute_vision_cost": deque(maxlen=cfg.grad_accumulation_steps),
+        "compute_llm_cost": deque(maxlen=cfg.grad_accumulation_steps),
+        "compute_token_budget": deque(maxlen=cfg.grad_accumulation_steps),
+        "compute_layer_depth": deque(maxlen=cfg.grad_accumulation_steps),
+        "compute_effective_token_budget": deque(maxlen=cfg.grad_accumulation_steps),
+        "compute_effective_layer_depth": deque(maxlen=cfg.grad_accumulation_steps),
+        "compute_slow_path_ratio": deque(maxlen=cfg.grad_accumulation_steps),
+        "total_loss_value": deque(maxlen=cfg.grad_accumulation_steps),
     }
 
     # Start training
@@ -1048,6 +1170,14 @@ def finetune(cfg: FinetuneConfig) -> None:
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=NUM_PATCHES,
+                compute_policy=compute_policy if cfg.use_adaptive_compute else None,
+                use_adaptive_compute=cfg.use_adaptive_compute,
+                adaptive_compute_mode="sample",
+                compute_cost_lambda=cfg.compute_cost_lambda,
+                compute_slow_path_cost_weight=cfg.compute_slow_path_cost_weight,
+                compute_policy_loss_coef=cfg.compute_policy_loss_coef,
+                compute_value_loss_coef=cfg.compute_value_loss_coef,
+                compute_entropy_coef=cfg.compute_entropy_coef,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
             )
@@ -1109,6 +1239,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
                     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                     action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
+                    compute_policy=compute_policy if cfg.use_adaptive_compute else None,
                     train_dataset=train_dataset,
                     distributed_state=distributed_state,
                 )
@@ -1128,6 +1259,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     log_step=log_step,
                     distributed_state=distributed_state,
                     val_time_limit=cfg.val_time_limit,
+                    compute_policy=compute_policy if cfg.use_adaptive_compute else None,
                 )
                 # Set model back to training mode after validation
                 vla.train()

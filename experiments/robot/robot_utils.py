@@ -105,6 +105,8 @@ def get_action(
     action_head: Optional[torch.nn.Module] = None,
     proprio_projector: Optional[torch.nn.Module] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
+    compute_policy: Optional[torch.nn.Module] = None,
+    fast_path_action_head: Optional[torch.nn.Module] = None,
     use_film: bool = False,
 ) -> Union[List[np.ndarray], np.ndarray]:
     """
@@ -119,6 +121,8 @@ def get_action(
         action_head: Optional action head for continuous actions
         proprio_projector: Optional proprioception projector
         noisy_action_projector: Optional noisy action projector for diffusion
+        compute_policy: Optional AdaVLA-RL compute policy
+        fast_path_action_head: Optional lightweight fast-path action head
         use_film: Whether to use FiLM
 
     Returns:
@@ -138,6 +142,8 @@ def get_action(
                 action_head=action_head,
                 proprio_projector=proprio_projector,
                 noisy_action_projector=noisy_action_projector,
+                compute_policy=compute_policy,
+                fast_path_action_head=fast_path_action_head,
                 use_film=use_film,
             )
         else:
