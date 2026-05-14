@@ -33,6 +33,8 @@ from experiments.robot.libero.libero_utils import (
 )
 from experiments.robot.openvla_utils import (
     get_action_head,
+    get_compute_policy,
+    get_fast_path_action_head,
     get_noisy_action_projector,
     get_processor,
     get_proprio_projector,
@@ -95,6 +97,15 @@ class GenerateConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 2                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = True                         # Whether to include proprio state in input
+    use_adaptive_compute: bool = False               # If True, enables AdaVLA-RL dynamic compute at inference
+    adaptive_compute_mode: str = "greedy"            # "greedy" for eval, "sample" for exploration/debugging
+    compute_policy_checkpoint: Union[str, Path] = "" # Optional compute_policy checkpoint file or directory
+    compute_policy_hidden_dim: int = 512             # Must match training
+    compute_token_budgets: tuple = (16, 32, 64, 128) # Candidate visual token budgets
+    compute_layer_depths: tuple = (4, 8, 12)         # Candidate language-model depths
+    use_fast_path: bool = False                      # If True, load and use optional fast-path action head
+    fast_path_checkpoint: Union[str, Path] = ""      # Optional fast-path checkpoint file or directory
+    fast_path_hidden_dim: int = 512                  # Must match fast-path training
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
     num_open_loop_steps: int = 8                     # Number of actions to execute open-loop before requerying policy
@@ -167,13 +178,21 @@ def initialize_model(cfg: GenerateConfig):
     if cfg.use_diffusion:
         noisy_action_projector = get_noisy_action_projector(cfg, model.llm_dim)
 
+    compute_policy = None
+    if cfg.use_adaptive_compute:
+        compute_policy = get_compute_policy(cfg, model.llm_dim)
+
+    fast_path_action_head = None
+    if cfg.use_fast_path:
+        fast_path_action_head = get_fast_path_action_head(cfg, model.llm_dim)
+
     # Get OpenVLA processor if needed
     processor = None
     if cfg.model_family == "openvla":
         processor = get_processor(cfg)
         check_unnorm_key(cfg, model)
 
-    return model, action_head, proprio_projector, noisy_action_projector, processor
+    return model, action_head, proprio_projector, noisy_action_projector, compute_policy, fast_path_action_head, processor
 
 
 def check_unnorm_key(cfg: GenerateConfig, model) -> None:
@@ -285,6 +304,8 @@ def run_episode(
     action_head=None,
     proprio_projector=None,
     noisy_action_projector=None,
+    compute_policy=None,
+    fast_path_action_head=None,
     initial_state=None,
     log_file=None,
 ):
@@ -336,6 +357,8 @@ def run_episode(
                     action_head=action_head,
                     proprio_projector=proprio_projector,
                     noisy_action_projector=noisy_action_projector,
+                    compute_policy=compute_policy,
+                    fast_path_action_head=fast_path_action_head,
                     use_film=cfg.use_film,
                 )
                 action_queue.extend(actions)
@@ -369,6 +392,8 @@ def run_task(
     action_head=None,
     proprio_projector=None,
     noisy_action_projector=None,
+    compute_policy=None,
+    fast_path_action_head=None,
     total_episodes=0,
     total_successes=0,
     log_file=None,
@@ -418,6 +443,8 @@ def run_task(
             action_head,
             proprio_projector,
             noisy_action_projector,
+            compute_policy,
+            fast_path_action_head,
             initial_state,
             log_file,
         )
@@ -468,7 +495,15 @@ def eval_libero(cfg: GenerateConfig) -> float:
     set_seed_everywhere(cfg.seed)
 
     # Initialize model and components
-    model, action_head, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
+    (
+        model,
+        action_head,
+        proprio_projector,
+        noisy_action_projector,
+        compute_policy,
+        fast_path_action_head,
+        processor,
+    ) = initialize_model(cfg)
 
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
@@ -496,6 +531,8 @@ def eval_libero(cfg: GenerateConfig) -> float:
             action_head,
             proprio_projector,
             noisy_action_projector,
+            compute_policy,
+            fast_path_action_head,
             total_episodes,
             total_successes,
             log_file,
