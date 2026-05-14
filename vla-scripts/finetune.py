@@ -1020,6 +1020,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 "token_budgets": cfg.compute_token_budgets,
                 "layer_depths": cfg.compute_layer_depths,
             },
+            find_unused_params=True,
         )
 
     # Get number of vision patches
