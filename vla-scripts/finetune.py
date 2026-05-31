@@ -651,17 +651,20 @@ def save_training_checkpoint(
     # Merge LoRA weights into base model and save resulting model checkpoint
     # Note: Can be very slow on some devices; if so, we recommend merging offline
     if cfg.use_lora and cfg.merge_lora_during_training:
-        base_vla = AutoModelForVision2Seq.from_pretrained(
-            cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
-        )
-        merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
-        merged_vla = merged_vla.merge_and_unload()
-
+        # Only rank 0 needs to load the base model, merge the adapter, and save the
+        # result. The adapter is already on disk (guaranteed by the dist.barrier()
+        # above), so having every rank reload + merge the 7B model would just be
+        # redundant work whose result is discarded on all ranks except rank 0.
         if distributed_state.is_main_process:
+            base_vla = AutoModelForVision2Seq.from_pretrained(
+                cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
+            )
+            merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
+            merged_vla = merged_vla.merge_and_unload()
             merged_vla.save_pretrained(checkpoint_dir)
             print(f"Saved merged model for Step {log_step} at: {checkpoint_dir}")
 
-        # Wait for merged model to be saved
+        # Wait for merged model to be saved (all ranks reach this barrier)
         dist.barrier()
 
 
@@ -811,8 +814,13 @@ def finetune(cfg: FinetuneConfig) -> None:
     # the file to the downloaded or locally stored checkpoint directory so
     # that the user's changes to the VLA class logic go into effect
     if model_is_on_hf_hub(cfg.vla_path):
-        # Download model directly from Hugging Face Hub
-        vla_download_path = snapshot_download(repo_id=cfg.vla_path)
+        # Download model directly from Hugging Face Hub.
+        # `snapshot_download` is internally file-locked, but having all ranks
+        # call it concurrently still triggers one HF Hub API hit per rank and
+        # can race the post-download `update_auto_map` rewrite below. Let
+        # rank 0 populate the cache first; the others read the result.
+        with distributed_state.main_process_first():
+            vla_download_path = snapshot_download(repo_id=cfg.vla_path)
         # Overwrite VLA path
         cfg.vla_path = vla_download_path
     else:
@@ -830,14 +838,25 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Wait for model files to be synced
     dist.barrier()
 
-    # Load processor and VLA
-    processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
-    vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.vla_path,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    ).to(device_id)
+    # Load processor and VLA.
+    # `trust_remote_code=True` makes transformers copy the model's custom
+    # Python files (e.g. `processing_prismatic.py`) into a per-process
+    # dynamic-modules cache. That cache is process-local, so when N ranks
+    # call `from_pretrained` concurrently they race on the same destination
+    # file and at least one rank can read a partial write before the
+    # `class PrismaticProcessor` body has been emitted, raising:
+    #   AttributeError: module 'transformers_modules.<commit>.processing_prismatic'
+    #     has no attribute 'PrismaticProcessor'
+    # `main_process_first()` lets rank 0 finish the copy (and any implicit
+    # snapshot_download inside `from_pretrained`) before the others import.
+    with distributed_state.main_process_first():
+        processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
+        vla = AutoModelForVision2Seq.from_pretrained(
+            cfg.vla_path,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        ).to(device_id)
 
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
