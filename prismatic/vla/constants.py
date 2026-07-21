@@ -31,10 +31,10 @@ LIBERO_CONSTANTS = {
 }
 
 ALOHA_CONSTANTS = {
-    "NUM_ACTIONS_CHUNK": 25,
-    "ACTION_DIM": 14,
-    "PROPRIO_DIM": 14,
-    "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS,
+    "NUM_ACTIONS_CHUNK": 10, #한번 추론할
+    "ACTION_DIM": 14, # 왼팔 7차원 + 오른팔 7차원
+    "PROPRIO_DIM": 14, # 현재 양팔 joint/gripper state
+    "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS, # 데이터의 최솟값/최댓값을 기준으로 [-1,1] 정규화
 }
 
 BRIDGE_CONSTANTS = {
