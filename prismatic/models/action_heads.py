@@ -95,6 +95,10 @@ class L1RegressionActionHead(nn.Module):
             num_blocks=2, input_dim=input_dim*ACTION_DIM, hidden_dim=hidden_dim, output_dim=action_dim
         )
 
+    def forward(self, actions_hidden_states):
+        """Predict actions through the module call path (including DDP hooks)."""
+        return self.predict_action(actions_hidden_states)
+
     def predict_action(self, actions_hidden_states):
         # actions_hidden_states: last hidden states of Transformer corresponding to action tokens in sequence
         # - shape: (batch_size, chunk_len * action_dim, hidden_dim)
@@ -163,6 +167,10 @@ class DiffusionActionHead(nn.Module):
         self.num_diffusion_steps_train = num_diffusion_steps_train
         self.noise_scheduler = DDIMScheduler(num_train_timesteps=num_diffusion_steps_train, beta_schedule="squaredcos_cap_v2")
         self.time_encoder = SinusoidalPositionalEncoding(dim=hidden_dim)
+
+    def forward(self, actions_hidden_states):
+        """Predict noise through the module call path (including DDP hooks)."""
+        return self.predict_noise(actions_hidden_states)
 
     def sample_noisy_actions(self, ground_truth_actions):
         """

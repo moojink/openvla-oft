@@ -384,14 +384,14 @@ def run_forward_pass(
         )  # (B, act_chunk_len, D)
 
         if use_l1_regression:
-            # Predict action
-            predicted_actions = action_head.module.predict_action(actions_hidden_states)
+            # Call the DDP wrapper so its reducer is prepared for this forward/backward pass.
+            predicted_actions = action_head(actions_hidden_states)
             # Get full L1 loss
             loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
 
         if use_diffusion:
-            # Predict noise
-            noise_pred = action_head.module.predict_noise(actions_hidden_states)
+            # Call the DDP wrapper so action-head gradients are synchronized across ranks.
+            noise_pred = action_head(actions_hidden_states)
             # Get diffusion noise prediction MSE loss
             noise_pred = noise_pred.reshape(noise.shape)
             loss = nn.functional.mse_loss(noise_pred, noise, reduction="mean")
