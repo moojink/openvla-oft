@@ -385,13 +385,15 @@ def run_forward_pass(
 
         if use_l1_regression:
             # Predict action
-            predicted_actions = action_head.module.predict_action(actions_hidden_states)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                predicted_actions = action_head.module.predict_action(actions_hidden_states)
             # Get full L1 loss
             loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
 
         if use_diffusion:
             # Predict noise
-            noise_pred = action_head.module.predict_noise(actions_hidden_states)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                noise_pred = action_head.module.predict_noise(actions_hidden_states)
             # Get diffusion noise prediction MSE loss
             noise_pred = noise_pred.reshape(noise.shape)
             loss = nn.functional.mse_loss(noise_pred, noise, reduction="mean")
@@ -852,6 +854,11 @@ def finetune(cfg: FinetuneConfig) -> None:
             init_lora_weights="gaussian",
         )
         vla = get_peft_model(vla, lora_config)
+        # PEFT 0.11.1 stores the LoRA weights in the base model's bf16, where AdamW rounds away every update smaller
+        # than 1/512 of a weight. Keep the trainable weights in fp32 instead; compute stays bf16 under autocast.
+        for param in vla.parameters():
+            if param.requires_grad:
+                param.data = param.data.float()
         vla.print_trainable_parameters()
 
     # FiLM setup
@@ -892,7 +899,6 @@ def finetune(cfg: FinetuneConfig) -> None:
             cfg,
             device_id,
             {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
-            to_bf16=True,
         )
 
     # If applicable, instantiate diffusion action head and noisy action projector
@@ -908,7 +914,6 @@ def finetune(cfg: FinetuneConfig) -> None:
                 "action_dim": ACTION_DIM,
                 "num_diffusion_steps_train": cfg.num_diffusion_steps_train,
             },
-            to_bf16=True,
         )
         noisy_action_projector = init_module(
             NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim}
