@@ -73,6 +73,31 @@ for act in actions:
 
 See [SETUP.md](SETUP.md) for instructions on setting up the conda environment.
 
+### Run on Intel GPU (XPU)
+
+The inference code (the Quick Start above, the LIBERO evaluation in [LIBERO.md](LIBERO.md) and `vla-scripts/deploy.py`) runs on an Intel GPU (XPU) when no NVIDIA GPU is present: it picks the device by itself, so the commands stay the same. Set up the environment with Python 3.12 and the XPU build of PyTorch instead of the steps in [SETUP.md](SETUP.md):
+
+```bash
+conda create -n openvla-oft-xpu python=3.12 -y
+conda activate openvla-oft-xpu
+pip install torch torchvision --index-url https://download.pytorch.org/whl/xpu
+git clone https://github.com/moojink/openvla-oft.git
+cd openvla-oft
+pip install -e . --no-deps
+pip install -r requirements-xpu.txt
+pip install --no-deps "dlimp @ git+https://github.com/moojink/dlimp_openvla" "tensorflow_graphics==2021.12.3"
+```
+
+For the LIBERO evaluation (and the Quick Start, which imports it), install LIBERO as in [LIBERO.md](LIBERO.md) with these lines instead:
+
+```bash
+git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
+pip install -e LIBERO --config-settings editable_mode=compat  # so that `libero` imports with recent setuptools
+pip install -r experiments/robot/libero/libero_requirements.txt "numpy<2" "mujoco==3.2.7"  # tensorflow 2.16 needs NumPy 1, robosuite 1.4.1 does not run with MuJoCo 4
+```
+
+Training, Flash Attention 2, 8-bit and 4-bit loading and `vla-scripts/merge_lora_weights_and_save.py` stay CUDA-only.
+
 ## Training and Evaluation
 
 See [LIBERO.md](LIBERO.md) for fine-tuning/evaluating on LIBERO simulation benchmark task suites.
